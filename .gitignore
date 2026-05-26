@@ -1,0 +1,11 @@
+*.nii
+*.nii.gz
+*.npy
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+venv/
+.antigravitycli/
+.idea/
+.vscode/

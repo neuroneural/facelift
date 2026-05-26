@@ -6,7 +6,7 @@ import subprocess
 import lz4.frame
 import torch
 import numpy as np
-import pymongo
+import bson
 from pymongo import MongoClient
 import dask
 from dask.distributed import Client as DaskClient
@@ -92,8 +92,14 @@ def chunk_binobj(tensor_compressed, subject_id, kind, chunksize_mb=12):
             "id": subject_id,
             "chunk_id": i,
             "kind": kind,
-            "chunk": pymongo.binary.Binary(chunk),
+            "chunk": bson.Binary(chunk),
         }
+
+def tensor2bin_compressed(tensor):
+    """Serialize tensor to LZ4-compressed binary."""
+    buffer = io.BytesIO()
+    torch.save(tensor.to(torch.uint8), buffer)
+    return lz4.frame.compress(buffer.getvalue())
 
 def simple_dilate(mask, iterations=3):
     out = mask.copy()
@@ -113,8 +119,9 @@ def get_largest_connected_component(mask_np):
     cmd = ["niimath", "-", "-bwlabel", "26", "-"]
     res = subprocess.run(cmd, input=mask_bytes, capture_output=True, check=True)
     
-    # Parse labeled bytes
+    # Parse labeled bytes using local parser
     _, labeled_np = parse_nifti_bytes(res.stdout)
+    labeled_np = labeled_np.reshape(mask_np.shape)
     
     # Find unique labels and counts (excluding background label 0)
     labels, counts = np.unique(labeled_np, return_counts=True)
@@ -160,6 +167,7 @@ def process_subject(subject_id, db_host=MONGOHOST):
         print(f"Error fetching T1 for subject {subject_id}: {e}")
         return {"id": subject_id, "status": "failed", "error": f"fetch_subject_t1: {str(e)}"}
 
+    # 3. Fetch subject label3
     try:
         subject_label3 = get_sample(subject_id, "label3", COLLECTION_NAME, db)
         label3_np = subject_label3.cpu().numpy()
@@ -184,6 +192,7 @@ def process_subject(subject_id, db_host=MONGOHOST):
     # Also compute face mask and save back to MongoDB
     try:
         _, aligned_np = parse_nifti_bytes(aligned_bytes)
+        aligned_np = aligned_np.reshape(subject_np.shape)
         
         # Compute face mask (geometrically)
         brain_mask = (label3_np > 0)
@@ -215,17 +224,13 @@ def process_subject(subject_id, db_host=MONGOHOST):
         col_bin.delete_many({"id": subject_id, "kind": {"$in": ["aligned_ref", "face_mask"]}})
 
         # Save aligned_ref
-        buffer_ref = io.BytesIO()
-        torch.save(aligned_tensor, buffer_ref)
-        compressed_ref = lz4.frame.compress(buffer_ref.getvalue())
-        for chunk in chunk_binobj(compressed_ref, subject_id, "aligned_ref"):
+        compressed_ref = tensor2bin_compressed(aligned_tensor)
+        for chunk in chunk_binobj(compressed_ref, subject_id, "aligned_ref", 12):
             col_bin.insert_one(chunk)
 
         # Save face_mask
-        buffer_mask = io.BytesIO()
-        torch.save(face_mask_tensor, buffer_mask)
-        compressed_mask = lz4.frame.compress(buffer_mask.getvalue())
-        for chunk in chunk_binobj(compressed_mask, subject_id, "face_mask"):
+        compressed_mask = tensor2bin_compressed(face_mask_tensor)
+        for chunk in chunk_binobj(compressed_mask, subject_id, "face_mask", 12):
             col_bin.insert_one(chunk)
 
         # Update metadata descriptions

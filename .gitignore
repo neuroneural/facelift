@@ -9,3 +9,9 @@ venv/
 .antigravitycli/
 .idea/
 .vscode/
+
+# Educational files (ignored)
+mindfulmongo.py
+populate_HCP1200.py
+refacing.md
+

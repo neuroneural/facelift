@@ -15,7 +15,7 @@ from dask.distributed import Client as DaskClient
 MONGOHOST = "localhost"  # default local or port-forwarded host
 DB_NAME = "MindfulTensors"
 COLLECTION_NAME = "MRN"
-REFERENCE_ID = 1
+REFERENCE_ID = 963
 
 def name2collections(name: str, database):
     collection_bin = database[f"{name}.bin"]
@@ -95,6 +95,44 @@ def chunk_binobj(tensor_compressed, subject_id, kind, chunksize_mb=12):
             "chunk": pymongo.binary.Binary(chunk),
         }
 
+def simple_dilate(mask, iterations=3):
+    out = mask.copy()
+    for _ in range(iterations):
+        padded = np.pad(out, 1, mode='constant', constant_values=0)
+        out = (padded[2:, 1:-1, 1:-1] | padded[:-2, 1:-1, 1:-1] |
+               padded[1:-1, 2:, 1:-1] | padded[1:-1, :-2, 1:-1] |
+               padded[1:-1, 1:-1, 2:] | padded[1:-1, 1:-1, :-2] | out)
+    return out
+
+def get_largest_connected_component(mask_np):
+    # Package mask to NIfTI bytes
+    hdr = make_nifti_header(mask_np.shape, mask_np.dtype)
+    mask_bytes = hdr + mask_np.tobytes()
+    
+    # Run niimath stdin -bwlabel 26 stdout
+    cmd = ["niimath", "-", "-bwlabel", "26", "-"]
+    res = subprocess.run(cmd, input=mask_bytes, capture_output=True, check=True)
+    
+    # Parse labeled bytes
+    _, labeled_np = parse_nifti_bytes(res.stdout)
+    
+    # Find unique labels and counts (excluding background label 0)
+    labels, counts = np.unique(labeled_np, return_counts=True)
+    if len(labels) <= 1:
+        return mask_np
+        
+    # Filter out background label 0
+    non_bg = (labels > 0)
+    labels = labels[non_bg]
+    counts = counts[non_bg]
+    
+    # Find label of largest connected component
+    largest_label = labels[np.argmax(counts)]
+    
+    # Keep only the largest component
+    largest_mask = (labeled_np == largest_label).astype(np.uint8)
+    return largest_mask
+
 def process_subject(subject_id, db_host=MONGOHOST):
     # Connect to MongoDB inside the worker process
     client = MongoClient(f"mongodb://{db_host}:27017/")
@@ -114,13 +152,20 @@ def process_subject(subject_id, db_host=MONGOHOST):
             print(f"Error fetching reference T1 in worker for subject {subject_id}: {e}")
             return {"id": subject_id, "status": "failed", "error": f"fetch_reference: {str(e)}"}
 
-    # 2. Fetch subject T1
+    # 2. Fetch subject T1 and label3
     try:
         subject_t1 = get_sample(subject_id, "T1", COLLECTION_NAME, db)
         subject_np = subject_t1.cpu().numpy()
     except Exception as e:
         print(f"Error fetching T1 for subject {subject_id}: {e}")
-        return {"id": subject_id, "status": "failed", "error": f"fetch_subject: {str(e)}"}
+        return {"id": subject_id, "status": "failed", "error": f"fetch_subject_t1: {str(e)}"}
+
+    try:
+        subject_label3 = get_sample(subject_id, "label3", COLLECTION_NAME, db)
+        label3_np = subject_label3.cpu().numpy()
+    except Exception as e:
+        print(f"Error fetching label3 for subject {subject_id}: {e}")
+        return {"id": subject_id, "status": "failed", "error": f"fetch_subject_label3: {str(e)}"}
 
     # 3. Align reference T1 to subject T1 in-memory
     hdr_sub = make_nifti_header(subject_np.shape, subject_np.dtype)
@@ -136,36 +181,65 @@ def process_subject(subject_id, db_host=MONGOHOST):
         return {"id": subject_id, "status": "failed", "error": f"niimath: {stderr_msg}"}
 
     # 4. Parse the aligned reference bytes and save back to MongoDB
+    # Also compute face mask and save back to MongoDB
     try:
         _, aligned_np = parse_nifti_bytes(aligned_bytes)
         
-        # Cast aligned reference to uint8 to match T1 datatype and save space
+        # Compute face mask (geometrically)
+        brain_mask = (label3_np > 0)
+        dilated_brain = simple_dilate(brain_mask, iterations=12)
+        head_mask = (subject_np > 10)
+        
+        # Find brain center of mass Y and X coordinates
+        brain_indices = np.where(brain_mask)
+        y_center = int(np.mean(brain_indices[1])) if len(brain_indices[1]) > 0 else 128
+        x_center = int(np.mean(brain_indices[2])) if len(brain_indices[2]) > 0 else 96
+        
+        # Grid coordinates for masking
+        z_dim, y_dim, x_dim = subject_np.shape
+        Z, Y, X = np.ogrid[:z_dim, :y_dim, :x_dim]
+        
+        initial_face_mask = head_mask & (~dilated_brain) & (X > (x_center - 35)) & (Y > (y_center - 23))
+        initial_face_mask = initial_face_mask.astype(np.uint8)
+        
+        # Keep only the largest connected component using niimath -bwlabel 26
+        face_mask_np = get_largest_connected_component(initial_face_mask)
+        face_mask_tensor = torch.from_numpy(face_mask_np)
+
+        # Cast aligned reference to uint8 and apply face mask to optimize storage compression
         aligned_np = np.clip(aligned_np, 0, 255).astype(np.uint8)
+        aligned_np = aligned_np * face_mask_np
         aligned_tensor = torch.from_numpy(aligned_np)
 
-        # Compress to LZ4
-        buffer = io.BytesIO()
-        torch.save(aligned_tensor, buffer)
-        compressed_bytes = lz4.frame.compress(buffer.getvalue())
+        # Clean any existing chunks of these kinds for idempotency
+        col_bin.delete_many({"id": subject_id, "kind": {"$in": ["aligned_ref", "face_mask"]}})
 
-        # Clean any existing chunks of this kind for idempotency
-        col_bin.delete_many({"id": subject_id, "kind": "aligned_ref"})
-
-        # Insert new chunks
-        for chunk in chunk_binobj(compressed_bytes, subject_id, "aligned_ref"):
+        # Save aligned_ref
+        buffer_ref = io.BytesIO()
+        torch.save(aligned_tensor, buffer_ref)
+        compressed_ref = lz4.frame.compress(buffer_ref.getvalue())
+        for chunk in chunk_binobj(compressed_ref, subject_id, "aligned_ref"):
             col_bin.insert_one(chunk)
 
-        # Update metadata descriptions if not already updated
+        # Save face_mask
+        buffer_mask = io.BytesIO()
+        torch.save(face_mask_tensor, buffer_mask)
+        compressed_mask = lz4.frame.compress(buffer_mask.getvalue())
+        for chunk in chunk_binobj(compressed_mask, subject_id, "face_mask"):
+            col_bin.insert_one(chunk)
+
+        # Update metadata descriptions
         col_meta.update_one(
             {"id": subject_id},
             {
                 "$set": {
-                    "descriptions.aligned_ref": "Reference face (id=1) aligned to subject space"
+                    "descriptions.aligned_ref": f"Reference face (id={REFERENCE_ID}) aligned to subject space",
+                    "descriptions.face_mask": "Anatomically and geometrically restricted face mask for displacement masking"
                 }
             }
         )
     except Exception as e:
-        print(f"Error saving aligned reference for subject {subject_id}: {e}")
+        print(f"Error saving aligned reference and mask for subject {subject_id}: {e}")
         return {"id": subject_id, "status": "failed", "error": f"save_db: {str(e)}"}
 
     return {"id": subject_id, "status": "success"}

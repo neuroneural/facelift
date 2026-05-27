@@ -15,7 +15,7 @@ from dask.distributed import Client as DaskClient
 MONGOHOST = "localhost"  # default local or port-forwarded host
 DB_NAME = "MindfulTensors"
 COLLECTION_NAME = "MRN"
-REFERENCE_ID = 963
+REFERENCE_ID = 962
 
 def name2collections(name: str, database):
     collection_bin = database[f"{name}.bin"]
@@ -101,6 +101,71 @@ def tensor2bin_compressed(tensor):
     torch.save(tensor.to(torch.uint8), buffer)
     return lz4.frame.compress(buffer.getvalue())
 
+def otsu_threshold(arr):
+    """
+    Otsu's method: find the intensity threshold that maximises between-class
+    variance for a two-class (background / tissue) split.  Operates on the
+    non-zero voxels only so that the dominant zero-background peak does not
+    bias the histogram.  Returns at least 1.0 so the result is always positive.
+    """
+    nonzero = arr[arr > 0].ravel()
+    if nonzero.size == 0:
+        return 10.0
+    hist, edges = np.histogram(nonzero, bins=256,
+                               range=(float(nonzero.min()), float(nonzero.max())))
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    total = hist.sum()
+    if total == 0:
+        return 10.0
+    w0, w1 = 0.0, 1.0
+    sum_total = float((hist * centers).sum())
+    sum0 = 0.0
+    best_thresh, best_var = centers[0], 0.0
+    for i in range(len(hist)):
+        p = hist[i] / total
+        w0 += p
+        w1 -= p
+        sum0 += p * centers[i]
+        if w0 == 0 or w1 == 0:
+            continue
+        mu0 = sum0 / w0
+        mu1 = (sum_total / total - sum0) / w1
+        var = w0 * w1 * (mu0 - mu1) ** 2
+        if var > best_var:
+            best_var, best_thresh = var, centers[i]
+    return max(float(best_thresh), 1.0)
+
+
+def harmonize_intensity(aligned_np, subject_np, face_mask_np, p_low=5, p_high=95):
+    """
+    Linearly rescale the aligned reference face intensities to match the subject's
+    face intensity distribution, using a percentile-pair (p_low, p_high) mapping
+    for robustness against outliers.
+
+    Statistics are computed only within the face mask. The result is returned as
+    float32 — the caller is responsible for any downstream clipping / dtype cast.
+    """
+    ref_voxels = aligned_np[face_mask_np == 1].astype(np.float32)
+    sub_voxels = subject_np[face_mask_np == 1].astype(np.float32)
+
+    if ref_voxels.size == 0 or sub_voxels.size == 0:
+        return aligned_np.astype(np.float32)
+
+    ref_lo, ref_hi = np.percentile(ref_voxels, [p_low, p_high])
+    sub_lo, sub_hi = np.percentile(sub_voxels, [p_low, p_high])
+
+    ref_range = ref_hi - ref_lo
+    if ref_range < 1.0:
+        # Reference face has essentially no intensity variation — skip rescaling
+        # to avoid a degenerate scale factor.
+        return aligned_np.astype(np.float32)
+
+    scale = (sub_hi - sub_lo) / ref_range
+    shift = sub_lo - ref_lo * scale
+
+    return aligned_np.astype(np.float32) * scale + shift
+
+
 def simple_dilate(mask, iterations=3):
     out = mask.copy()
     for _ in range(iterations):
@@ -111,6 +176,9 @@ def simple_dilate(mask, iterations=3):
     return out
 
 def get_largest_connected_component(mask_np):
+    # If mask is already empty, return it directly to avoid niimath error
+    if mask_np.sum() == 0:
+        return mask_np
     # Package mask to NIfTI bytes
     hdr = make_nifti_header(mask_np.shape, mask_np.dtype)
     mask_bytes = hdr + mask_np.tobytes()
@@ -140,6 +208,25 @@ def get_largest_connected_component(mask_np):
     largest_mask = (labeled_np == largest_label).astype(np.uint8)
     return largest_mask
 
+def clean_and_verify_label(tensor, label_name):
+    """
+    Check if a label tensor has a dominant non-zero class (>50% of voxels).
+    If so, zero it out and return (cleaned_tensor, True).
+    Otherwise, return (tensor, False).
+    """
+    unique_vals, counts = torch.unique(tensor, return_counts=True)
+    total_voxels = tensor.numel()
+    
+    for val, count in zip(unique_vals, counts):
+        val_item = val.item()
+        pct = (count.item() / total_voxels) * 100
+        if val_item != 0 and pct > 50.0:
+            print(f"Warning: Subject label {label_name} has dominant class {val_item} covering {pct:.2f}% of volume. Zeroing it out.")
+            cleaned = tensor.clone()
+            cleaned[tensor == val] = 0
+            return cleaned, True
+    return tensor, False
+
 def process_subject(subject_id, db_host=MONGOHOST):
     # Connect to MongoDB inside the worker process
     client = MongoClient(f"mongodb://{db_host}:27017/")
@@ -159,7 +246,7 @@ def process_subject(subject_id, db_host=MONGOHOST):
             print(f"Error fetching reference T1 in worker for subject {subject_id}: {e}")
             return {"id": subject_id, "status": "failed", "error": f"fetch_reference: {str(e)}"}
 
-    # 2. Fetch subject T1 and label3
+    # 2. Fetch subject T1 and labels (label3, label50, label104, volumes104)
     try:
         subject_t1 = get_sample(subject_id, "T1", COLLECTION_NAME, db)
         subject_np = subject_t1.cpu().numpy()
@@ -167,13 +254,43 @@ def process_subject(subject_id, db_host=MONGOHOST):
         print(f"Error fetching T1 for subject {subject_id}: {e}")
         return {"id": subject_id, "status": "failed", "error": f"fetch_subject_t1: {str(e)}"}
 
-    # 3. Fetch subject label3
     try:
         subject_label3 = get_sample(subject_id, "label3", COLLECTION_NAME, db)
-        label3_np = subject_label3.cpu().numpy()
     except Exception as e:
         print(f"Error fetching label3 for subject {subject_id}: {e}")
         return {"id": subject_id, "status": "failed", "error": f"fetch_subject_label3: {str(e)}"}
+
+    try:
+        subject_label50 = get_sample(subject_id, "label50", COLLECTION_NAME, db)
+    except Exception as e:
+        print(f"Error fetching label50 for subject {subject_id}: {e}")
+        return {"id": subject_id, "status": "failed", "error": f"fetch_subject_label50: {str(e)}"}
+
+    try:
+        subject_label104 = get_sample(subject_id, "label104", COLLECTION_NAME, db)
+    except Exception as e:
+        print(f"Error fetching label104 for subject {subject_id}: {e}")
+        return {"id": subject_id, "status": "failed", "error": f"fetch_subject_label104: {str(e)}"}
+
+    try:
+        subject_volumes104 = get_sample(subject_id, "volumes104", COLLECTION_NAME, db)
+    except Exception as e:
+        print(f"Error fetching volumes104 for subject {subject_id}: {e}")
+        return {"id": subject_id, "status": "failed", "error": f"fetch_subject_volumes104: {str(e)}"}
+
+    # Clean labels on the fly if corrupted
+    cleaned_label3, l3_modified = clean_and_verify_label(subject_label3, "label3")
+    cleaned_label50, l50_modified = clean_and_verify_label(subject_label50, "label50")
+    cleaned_label104, l104_modified = clean_and_verify_label(subject_label104, "label104")
+
+    if l104_modified:
+        # volumes104 = (bincount(cleaned_label104) % 256) cast to uint8
+        counts = torch.bincount(cleaned_label104.flatten(), minlength=104)
+        cleaned_volumes104 = (counts % 256).to(torch.uint8)
+        v104_modified = True
+    else:
+        cleaned_volumes104 = subject_volumes104
+        v104_modified = False
 
     # 3. Align reference T1 to subject T1 in-memory
     hdr_sub = make_nifti_header(subject_np.shape, subject_np.dtype)
@@ -194,53 +311,123 @@ def process_subject(subject_id, db_host=MONGOHOST):
         _, aligned_np = parse_nifti_bytes(aligned_bytes)
         aligned_np = aligned_np.reshape(subject_np.shape)
         
-        # Compute face mask (geometrically)
+        # Compute face mask (geometrically) using cleaned label3
+        label3_np = cleaned_label3.cpu().numpy()
         brain_mask = (label3_np > 0)
-        dilated_brain = simple_dilate(brain_mask, iterations=12)
-        head_mask = (subject_np > 10)
         
-        # Find brain center of mass Y and X coordinates
+        # Check for corrupted brain masks (covering too much of the volume or empty)
+        if brain_mask.sum() > (subject_np.size * 0.5):
+            print(f"Warning: Subject {subject_id} has abnormally large brain mask ({brain_mask.sum()} voxels). Skipping.")
+            return {"id": subject_id, "status": "failed", "error": "corrupted_brain_mask"}
+        if brain_mask.sum() == 0:
+            print(f"Warning: Subject {subject_id} has empty brain mask. Skipping.")
+            return {"id": subject_id, "status": "failed", "error": "empty_brain_mask"}
+            
+        dilated_brain = simple_dilate(brain_mask, iterations=12)
+
+        # Brain CoM for geometric bounds
         brain_indices = np.where(brain_mask)
         y_center = int(np.mean(brain_indices[1])) if len(brain_indices[1]) > 0 else 128
         x_center = int(np.mean(brain_indices[2])) if len(brain_indices[2]) > 0 else 96
-        
-        # Grid coordinates for masking
+
         z_dim, y_dim, x_dim = subject_np.shape
         Z, Y, X = np.ogrid[:z_dim, :y_dim, :x_dim]
-        
-        initial_face_mask = head_mask & (~dilated_brain) & (X > (x_center - 35)) & (Y > (y_center - 23))
-        initial_face_mask = initial_face_mask.astype(np.uint8)
-        
-        # Keep only the largest connected component using niimath -bwlabel 26
-        face_mask_np = get_largest_connected_component(initial_face_mask)
-        face_mask_tensor = torch.from_numpy(face_mask_np)
+        geom = (X > (x_center - 35)) & (Y > (y_center - 23))
 
-        # Cast aligned reference to uint8 and apply face mask to optimize storage compression
-        aligned_np = np.clip(aligned_np, 0, 255).astype(np.uint8)
-        aligned_np = aligned_np * face_mask_np
-        aligned_tensor = torch.from_numpy(aligned_np)
+        # warp_mask: pure geometry — every voxel in the face quadrant that isn't
+        # brain. No intensity threshold, no LCC. Reproducible at inference from
+        # brain CoM alone, and generous enough to cover any face shape.
+        warp_mask_np = ((~dilated_brain) & geom).astype(np.uint8)
+        warp_mask_tensor = torch.from_numpy(warp_mask_np)
 
-        # Clean any existing chunks of these kinds for idempotency
-        col_bin.delete_many({"id": subject_id, "kind": {"$in": ["aligned_ref", "face_mask"]}})
+        # ref_face_mask: Otsu on the aligned reference + same geometric bounds + LCC.
+        # Used only to gate the hybrid transplant — not stored.
+        ref_head_mask = (aligned_np > otsu_threshold(aligned_np))
+        ref_initial = (ref_head_mask & (~dilated_brain) & geom).astype(np.uint8)
+        ref_face_mask_np = get_largest_connected_component(ref_initial)
+        if ref_face_mask_np.sum() == 0:
+            print(f"Warning: Subject {subject_id} has empty reference face mask. Skipping.")
+            return {"id": subject_id, "status": "failed", "error": "empty_ref_face_mask"}
 
-        # Save aligned_ref
-        compressed_ref = tensor2bin_compressed(aligned_tensor)
-        for chunk in chunk_binobj(compressed_ref, subject_id, "aligned_ref", 12):
+        # Harmonize within the overlap of ref_face_mask and subject tissue —
+        # avoids skewing P5/P95 with background voxels where the subject has air
+        # but the reference has tissue.
+        subject_head_mask = (subject_np > otsu_threshold(subject_np))
+        harmonize_region = ref_face_mask_np & subject_head_mask
+        aligned_harmonized = harmonize_intensity(aligned_np, subject_np, harmonize_region)
+
+        # Build the hybrid: subject T1 with the harmonized reference face
+        # transplanted at ref_face_mask (reference's own extent, not subject's).
+        # Training target: L1(warp(T1, velocity), hybrid) over the full volume.
+        hybrid_np = subject_np.astype(np.float32).copy()
+        hybrid_np[ref_face_mask_np == 1] = aligned_harmonized[ref_face_mask_np == 1]
+        hybrid_np = np.clip(hybrid_np, 0, 255).astype(np.uint8)
+        hybrid_tensor = torch.from_numpy(hybrid_np)
+
+        # Delete existing chunks for all kinds we are about to write, plus
+        # stale kinds from previous pipeline versions.
+        kinds_to_delete = ["hybrid", "warp_mask", "face_mask", "aligned_ref"]
+        if l3_modified:
+            kinds_to_delete.append("label3")
+        if l50_modified:
+            kinds_to_delete.append("label50")
+        if l104_modified:
+            kinds_to_delete.extend(["label104", "volumes104"])
+
+        col_bin.delete_many({"id": subject_id, "kind": {"$in": kinds_to_delete}})
+
+        # Save hybrid
+        compressed_hybrid = tensor2bin_compressed(hybrid_tensor)
+        for chunk in chunk_binobj(compressed_hybrid, subject_id, "hybrid", 12):
             col_bin.insert_one(chunk)
 
-        # Save face_mask
-        compressed_mask = tensor2bin_compressed(face_mask_tensor)
-        for chunk in chunk_binobj(compressed_mask, subject_id, "face_mask", 12):
+        # Save warp_mask (generous geometric quadrant; gates velocity field at
+        # training and inference; compresses very well due to large zero regions)
+        compressed_warp = tensor2bin_compressed(warp_mask_tensor)
+        for chunk in chunk_binobj(compressed_warp, subject_id, "warp_mask", 12):
             col_bin.insert_one(chunk)
 
-        # Update metadata descriptions
+        # Save cleaned labels if they were modified
+        if l3_modified:
+            compressed_l3 = tensor2bin_compressed(cleaned_label3)
+            for chunk in chunk_binobj(compressed_l3, subject_id, "label3", 12):
+                col_bin.insert_one(chunk)
+            print(f"Saved cleaned label3 for subject {subject_id} to database.")
+
+        if l50_modified:
+            compressed_l50 = tensor2bin_compressed(cleaned_label50)
+            for chunk in chunk_binobj(compressed_l50, subject_id, "label50", 12):
+                col_bin.insert_one(chunk)
+            print(f"Saved cleaned label50 for subject {subject_id} to database.")
+
+        if l104_modified:
+            compressed_l104 = tensor2bin_compressed(cleaned_label104)
+            for chunk in chunk_binobj(compressed_l104, subject_id, "label104", 12):
+                col_bin.insert_one(chunk)
+            compressed_v104 = tensor2bin_compressed(cleaned_volumes104)
+            for chunk in chunk_binobj(compressed_v104, subject_id, "volumes104", 12):
+                col_bin.insert_one(chunk)
+            print(f"Saved cleaned label104 and volumes104 for subject {subject_id} to database.")
+
+        # Update metadata — remove stale aligned_ref description, add hybrid
         col_meta.update_one(
             {"id": subject_id},
             {
                 "$set": {
-                    "descriptions.aligned_ref": f"Reference face (id={REFERENCE_ID}) aligned to subject space",
-                    "descriptions.face_mask": "Anatomically and geometrically restricted face mask for displacement masking"
-                }
+                    "descriptions.hybrid": (
+                        f"Subject T1 with harmonized reference face (id={REFERENCE_ID}) "
+                        f"transplanted at the reference face mask. Training target for displacement model."
+                    ),
+                    "descriptions.warp_mask": (
+                        "Generous geometric quadrant mask (no LCC, no intensity threshold). "
+                        "Gates the displacement field at training and inference. "
+                        "Derivable from brain CoM alone — no reference needed."
+                    ),
+                },
+                "$unset": {
+                    "descriptions.aligned_ref": "",
+                    "descriptions.face_mask": "",
+                },
             }
         )
     except Exception as e:
